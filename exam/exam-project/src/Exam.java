@@ -1,7 +1,14 @@
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
-import java.util.Optional;
+import java.text.BreakIterator;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /*
 This is the exam for DM584 - Concurrent Programming, Spring 2024.
@@ -114,7 +121,39 @@ public class Exam {
 	 * @return a list of words that, within a file inside dir, appear on only one line
 	 */
 	private static List<LocatedWord> findWordsUniqueToALine(Path dir) {
-		throw new UnsupportedOperationException(); // Remove this once you implement the method
+		ArrayList<LocatedWord> result = new ArrayList<LocatedWord>();
+
+		GetStandardFileList(dir).stream()
+				.parallel()
+				.map(Exam::ExtractUniqueWords) // Finds the unique words for each file
+				.forEach(result::addAll); // Adds the results to the final list
+
+		return new ArrayList<>(result);
+	}
+
+
+	// Takes a file and returns a list of words that appear only once in that file
+	private static ArrayList<LocatedWord> ExtractUniqueWords(Path file){
+		ConcurrentMap<String, ConcurrentLinkedQueue<LocatedWord>> wordOccurrencesInFile = new ConcurrentHashMap<>();
+		AtomicInteger lineNumber = new AtomicInteger();
+		GetFileLinesStream(file).forEach(line -> {
+			lineNumber.incrementAndGet();
+			extractWords(line)
+					.forEach(word -> { // Adds the word to the map
+						String lowerCaseWord = word.toLowerCase();
+						wordOccurrencesInFile.computeIfAbsent(lowerCaseWord, k -> new ConcurrentLinkedQueue<>())
+								.add(new LocatedWord(lowerCaseWord, lineNumber.get(), file));
+					});
+		});
+
+		ConcurrentLinkedQueue<LocatedWord> result = new ConcurrentLinkedQueue<>();
+		wordOccurrencesInFile.forEach((word, locations) -> { // Adds the unique words to the result
+			if (locations.size() == 1) {
+				result.add(locations.peek());
+			}
+		});
+
+		return new ArrayList<>(result);
 	}
 
 	/** Returns the line with the highest number of occurrences of the letter 'a' among all the lines
@@ -138,8 +177,36 @@ public class Exam {
 	 * @return the line with the highest number of occurrences of 'a' found among all text files inside of dir
 	 */
 	private static Location lineWithMostA(Path dir) {
-		throw new UnsupportedOperationException(); // Remove this once you implement the method
+		return GetStandardFileList(dir).stream()
+				.parallel()
+				.map(Exam::highestForFile) // Finds the highest for each file
+				.sorted(Comparator.comparing(l -> l.location().filepath().toAbsolutePath())) // Sorts by file path
+				.max(Comparator.comparing(LocationWithCount::count)) // Finds the highest of all
+				.map(LocationWithCount::location) // Returns the location
+				.orElse(new Location(null, -1));
 	}
+
+
+	// Takes a file and returns the location with the highest number of 'a' occurrences in that file
+	private static LocationWithCount highestForFile(Path file) {
+		AtomicInteger lineNumber = new AtomicInteger(1);
+		AtomicReference<LocationWithCount> maxLocation = new AtomicReference<>(new LocationWithCount(new Location(file, -1), -1));
+
+		GetFileLinesStream(file)
+				.map(line -> new LocationWithCount(new Location(file, lineNumber.getAndIncrement()), countA(line)))
+				.max(Comparator.comparingInt(LocationWithCount::count))
+				.ifPresent(maxLocation::set);
+
+		return maxLocation.get();
+	}
+
+
+	// Returns the amount of a characters in a string
+	private static int countA(String line) {
+		return (int) line.chars().filter(c -> c == 'a' || c == 'A').count();
+	}
+
+	private record LocationWithCount(Location location, int count) {}
 
 	/**
 	 * Returns an Optional<LocatedWord> (see below) about a word found in the files
@@ -176,7 +243,31 @@ public class Exam {
 	 * @return an optional LocatedWord about a word containing exactly n consonants
 	 */
 	private static Optional<LocatedWord> wordWithConsonants(Path dir, int numberOfConsonants) {
-		throw new UnsupportedOperationException(); // Remove this once you implement the method
+		AtomicReference<LocatedWord> result = new AtomicReference<>(null);
+		boolean found = GetStandardFileList(dir).stream()
+				.parallel()
+				.anyMatch(file -> { // Stops after finding a word
+					AtomicInteger lineNumber = new AtomicInteger(1);
+					return GetFileLinesStream(file)
+							.anyMatch(line -> isMatchingWordFound(numberOfConsonants, result, line, lineNumber.getAndIncrement(), file));
+				});
+		return found ? Optional.of(result.get()) : Optional.empty();
+	}
+
+
+	// Returns the amount of consonants in a string
+	private static int countConsonants(String word) {
+		return (int) word.chars().filter(c -> "bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ".indexOf(c) != -1).count();
+	}
+
+
+	// Returns true if a word with the given number of consonants is found
+	private static boolean isMatchingWordFound(int numberOfConsonants, AtomicReference<LocatedWord> reference, String line, int lineNo, Path file) {
+		extractWords(line)
+				.filter(wordStr -> countConsonants(wordStr) == numberOfConsonants)
+				.findFirst()
+				.ifPresent(word -> reference.set(new LocatedWord(word, lineNo, file)));
+		return reference.get() != null;
 	}
 
 	/** Returns a list of words found in the given directory having the given string as a substring.
@@ -209,7 +300,111 @@ public class Exam {
 	 * @return a list of words containing the given substring
 	 */
 	private static List<LocatedWord> wordsWithSubstring(Path dir, String substring, int limit) {
-		throw new UnsupportedOperationException(); // Remove this once you implement the method
+		var result = new ArrayList<LocatedWord>();
+		var resultsFound = new AtomicInteger(0);
+		ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+		ExecutorCompletionService<List<LocatedWord>> completionService = new ExecutorCompletionService<>(executor);
+
+		try {
+			List<Path> files = GetStandardFileList(dir);
+			for (Path file : files) { // Submitting tasks for each file
+				completionService.submit(() -> getLocatedWordArrayList(substring, limit, file, resultsFound));
+			}
+
+			// Stops after either reaching the limit or processing all files
+			for (int i = 0; i < files.size() && result.size() < limit; i++) {
+				result.addAll(completionService.take().get());
+			}
+
+		} catch (ExecutionException | InterruptedException e) {
+			throw new RuntimeException(e);
+		} finally {
+			executor.shutdownNow();
+		}
+
+		return ExtractLimit(result, limit);
+	}
+
+
+	// Returns a list of words in a file containing the given substring
+	private static List<LocatedWord> getLocatedWordArrayList(String substring, int limit, Path file, AtomicInteger resultsFound) {
+		AtomicInteger lineNumber = new AtomicInteger(1);
+		List<LocatedWord> partResult = new ArrayList<>();
+
+		for (String line : (Iterable<String>) GetFileLinesStream(file)::iterator) {
+			if (resultsFound.get() >= limit) {
+				break;
+			}
+			List<String> wordList = extractWords(line).toList();
+			for (String word : wordList) {
+				if (word.contains(substring)) {
+					partResult.add(new LocatedWord(word, lineNumber.get(), file));
+					if (resultsFound.incrementAndGet() >= limit) {
+						return partResult;
+					}
+				}
+			}
+			lineNumber.incrementAndGet();
+		}
+		return partResult;
+	}
+
+
+	// Returns a list of the first limit elements of a list
+	private static List<LocatedWord> ExtractLimit(ArrayList<LocatedWord> result, int limit) {
+		return result.stream().limit(limit).collect(Collectors.toCollection(ArrayList::new));
+	}
+
+
+	// Global Helper Methods ##########################################################################################
+
+
+	//No need for repeating
+	private static List<Path> GetStandardFileList(Path dir) {
+		List<Path> returnFileList;
+		try (Stream<Path> fileStream = Files.walk(dir)){
+			returnFileList =  fileStream
+					.filter(Files::isRegularFile)
+					.filter(path -> path.toString().endsWith(".txt"))
+					.collect(Collectors.toList());
+		} catch (IOException e) {
+			throw new InternalException("IO " + dir );
+		} catch (SecurityException e) {
+			throw new InternalException("Security " + dir );
+		}
+		return returnFileList;
+	}
+
+	//Removes the horrid repeated and nested try catch blocks
+	private static Stream<String> GetFileLinesStream(Path file) {
+		try {
+			return Files.lines(file);
+		} catch (IOException e) {
+			throw new InternalException("IO " + file);
+		} catch (SecurityException e) {
+			throw new InternalException("Security " + file);
+		}
+	}
+
+	// Returns a stream of words in a string
+	public static Stream< String > extractWords( String s ) {
+		List< String > words = new ArrayList<>();
+
+		BreakIterator it = BreakIterator.getWordInstance();
+		it.setText( s );
+
+		int start = it.first();
+		int end = it.next();
+		while( end != BreakIterator.DONE ) {
+			String word = s.substring( start, end );
+			if ( Character.isLetterOrDigit( word.charAt( 0 ) ) ) {
+				words.add( word );
+			}
+			start = end;
+			end = it.next();
+		}
+
+		return words.stream();
 	}
 
 	// Do not change this class
